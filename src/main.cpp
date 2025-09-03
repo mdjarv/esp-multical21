@@ -22,7 +22,7 @@
 #include <PubSubClient.h>
 #include <ArduinoOTA.h>
 #include "WaterMeter.h"
-//#include "config.h"
+#include "config.h"
 
 CREDENTIAL currentWifi; // global to store found wifi
 
@@ -34,7 +34,7 @@ WaterMeter waterMeter(mqttClient);
 
 char MyIp[16];
 int cred = -1;
-bool mqttEnabled = false;   // true, if a broker is given in credentials.h
+bool mqttEnabled = true;   // true, if a broker is given in credentials.h
 
 bool ConnectWifi(void)
 {
@@ -127,7 +127,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int len)
   String t(topic);
   byte *p = new byte[len];
   memcpy(p, payload, len);
-  
+
 /*  Serial.print("MQTT-RECV: ");
   Serial.print(topic);
   Serial.print(" ");
@@ -162,8 +162,16 @@ bool mqttConnect()
 
   // use given MQTT broker
   mqttClient.setServer(currentWifi.mqtt_broker, 1883);
-    
-  // connect client with retainable last will message
+
+  // Increase buffer size for Home Assistant discovery messages
+  // Default is 256 bytes, but discovery messages can be 600-800 bytes
+  if (mqttClient.setBufferSize(1024)) {
+    Serial.printf("MQTT buffer size set to: %d bytes\n", mqttClient.getBufferSize());
+  } else {
+    Serial.println("Warning: Failed to set MQTT buffer size!");
+  }
+
+  // connect client with retainable last will message (fixed format)
   if (strlen(currentWifi.mqtt_username) && strlen(currentWifi.mqtt_password))
   {
     Serial.print("with user: ");
@@ -172,16 +180,16 @@ bool mqttConnect()
     connected = mqttClient.connect( ESP_NAME
                                   , currentWifi.mqtt_username
                                   , currentWifi.mqtt_password
-                                  , MQTT_PREFIX"/online"
+                                  , MQTT_PREFIX"/availability"
                                   , 0
                                   , true
-                                  , "False"
+                                  , "offline"
                                   );
   }
   else
   {
     // connect without user/pass
-    connected = mqttClient.connect(ESP_NAME, MQTT_PREFIX"/online", 0, true, "False");
+    connected = mqttClient.connect(ESP_NAME, MQTT_PREFIX"/availability", 0, true, "offline");
   }
 
   mqttClient.setCallback(mqttCallback);
@@ -191,20 +199,21 @@ bool mqttConnect()
 
 void mqttSubscribe()
 {
-  // publish online status
-  mqttClient.publish(MQTT_PREFIX "/online", "True", true);
-//  Serial.print("MQTT-SEND: ");
-//  Serial.print(s);
-//  Serial.println(" True");
-  
+  // Publish availability status (matches discovery config) - properly quoted for JSON compatibility
+  mqttClient.publish(MQTT_PREFIX "/availability", "\"online\"", true);
+
+  // Publish legacy online status for backward compatibility (fixed: no quotes)
+  mqttClient.publish(MQTT_PREFIX "/online", "online", true);
+
+#if DEBUG >= 1
+  Serial.println("Published device availability: online");
+#endif
+
   // publish ip address
   IPAddress MyIP = WiFi.localIP();
-  snprintf(MyIp, 16, "%d.%d.%d.%d", MyIP[0], MyIP[1], MyIP[2], MyIP[3]);
-  mqttClient.publish(MQTT_PREFIX"/ipaddr", MyIp, true);
-//  Serial.print("MQTT-SEND: ");
-//  Serial.print(s);
-//  Serial.print(" ");
-//  Serial.println(MyIp);
+  char ipJson[24];
+  snprintf(ipJson, sizeof(ipJson), "\"%d.%d.%d.%d\"", MyIP[0], MyIP[1], MyIP[2], MyIP[3]);
+  mqttClient.publish(MQTT_PREFIX"/ipaddr", ipJson, true);
 
   // if True -> perform an reset
   mqttClient.subscribe(MQTT_PREFIX"/reset");
@@ -254,12 +263,12 @@ void setup()
     pinMode(LED_BUILTIN, OUTPUT);
 
     Serial.begin(115200);
+    delay(1000);  // Give serial time to initialize
+    Serial.println("ESP32-C3 Multical21 Reader Starting...");
 
     uint8_t key[16] = { ENCRYPTION_KEY }; // AES-128 key
     uint8_t id[4] = { SERIAL_NUMBER }; // Multical21 serial number
-
-    waterMeter.begin(key, id);
-    Serial.println("Setup done...");
+    waterMeter.begin(key, id);  // Restored watermeter initialization
 }
 
 enum ControlStateType
@@ -289,7 +298,7 @@ void loop()
 
       ControlState = StateWifiConnect;
       break;
-      
+
     case StateWifiConnect:
       //Serial.println("StateWifiConnect:");
       // station mode
@@ -300,7 +309,7 @@ void loop()
       }
 
       delay(500);
-      
+
       if (WiFi.status() == WL_CONNECTED)
       {
         Serial.println("");
@@ -310,7 +319,7 @@ void loop()
         Serial.println(WiFi.localIP());
 
         setupOTA();
-        
+
         if (strlen(currentWifi.mqtt_broker)) // MQTT is used
         {
           mqttEnabled = true;
@@ -333,7 +342,7 @@ void loop()
         // try again
         ControlState = StateNotConnected;
 
-        // reboot 
+        // reboot
         ESP.restart();
       }
       break;
@@ -349,7 +358,7 @@ void loop()
         ControlState = StateNotConnected;
         break; // exit (hopefully) switch statement
       }
-      
+
       if (mqttEnabled)
       {
         if (mqttConnect())
@@ -371,7 +380,7 @@ void loop()
         ControlState = StateConnected;
       }
       ArduinoOTA.handle();
-      
+
       break;
 
     case StateConnected:
@@ -388,7 +397,11 @@ void loop()
         {
           // subscribe to given topics
           mqttSubscribe();
-          
+
+          // Publish Home Assistant discovery and availability
+          waterMeter.publishHomeAssistantDiscovery();
+          waterMeter.publishAvailability(true);
+
           ControlState = StateOperating;
           digitalWrite(LED_BUILTIN, LOW); // on
           Serial.println("StateOperating:");
@@ -400,9 +413,9 @@ void loop()
         ControlState = StateOperating;
       }
       ArduinoOTA.handle();
-      
+
       break;
-    
+
     case StateOperating:
       //Serial.println("StateOperating:");
 
@@ -436,6 +449,6 @@ void loop()
       break;
 
     default:
-      Serial.println("Error: invalid ControlState");  
+      Serial.println("Error: invalid ControlState");
   }
 }

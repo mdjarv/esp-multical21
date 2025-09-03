@@ -28,20 +28,33 @@ void WaterMeter::enableMqtt(bool enabled)
 // ChipSelect assert
 inline void WaterMeter::selectCC1101(void)
 {
+#if defined(ESP32)
+  digitalWrite(CC1101_CS, LOW);
+#else
   digitalWrite(SS, LOW);
+#endif
 }
 
 // ChipSelect deassert
 inline void WaterMeter::deselectCC1101(void)
 {
+#if defined(ESP32)
+  digitalWrite(CC1101_CS, HIGH);
+#else
   digitalWrite(SS, HIGH);
+#endif
 }
 
 // wait for MISO pulling down
 inline void WaterMeter::waitMiso(void)
 {
+#if defined(ESP32)
+  while (digitalRead(CC1101_MISO) == HIGH)
+    ;
+#else
   while (digitalRead(MISO) == HIGH)
     ;
+#endif
 }
 
 // write a single register of CC1101
@@ -102,8 +115,13 @@ void WaterMeter::reset(void)
   deselectCC1101();
   delayMicroseconds(3);
 
+#if defined(ESP32)
+  digitalWrite(CC1101_MOSI, LOW);
+  digitalWrite(CC1101_SCK, HIGH); // see CC1101 datasheet 11.3
+#else
   digitalWrite(MOSI, LOW);
   digitalWrite(SCK, HIGH); // see CC1101 datasheet 11.3
+#endif
 
   selectCC1101();
   delayMicroseconds(3);
@@ -209,9 +227,11 @@ IRAM_ATTR void WaterMeter::cc1101Isr(void *p)
 // does the frame checkin and decryption
 void WaterMeter::loop(void)
 {
+  static unsigned long lastDebugOutput = 0;
+
+  // Check for packets via interrupt (GDO0 connected to GPIO3)
   if (packetAvailable)
   {
-    // Serial.println("packet received");
     //  Disable wireless reception interrupt
     detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
 
@@ -223,9 +243,36 @@ void WaterMeter::loop(void)
     attachInterruptArg(digitalPinToInterrupt(CC1101_GDO0), cc1101Isr, this, FALLING);
   }
 
+  // Periodic debug output every 10 seconds
+  if (millis() - lastDebugOutput > 10000)
+  {
+    lastDebugOutput = millis();
+    uint8_t marcState = readReg(CC1101_MARCSTATE, CC1101_STATUS_REGISTER);
+    uint8_t rxBytes = readReg(CC1101_RXBYTES, CC1101_STATUS_REGISTER);
+    uint8_t rssi = readReg(CC1101_RSSI, CC1101_STATUS_REGISTER);
+
+    Serial.printf("CC1101 Status - MARC: 0x%02X, RX bytes: %d, RSSI: %d dBm\n",
+                  marcState, rxBytes & 0x7F, (rssi >= 128) ? (rssi - 256) / 2 - 74 : rssi / 2 - 74);
+
+    // Check if we're still in RX mode
+    if (marcState != MARCSTATE_RX)
+    {
+      Serial.printf("Not in RX mode (state: 0x%02X), restarting receiver...\n", marcState);
+      startReceiver();
+    }
+
+    // Check for FIFO overflow (shouldn't happen with proper GDO0 interrupt handling)
+    if (rxBytes & 0x80)
+    {
+      Serial.println("Warning: RX FIFO overflow detected! Restarting receiver...");
+      startReceiver();
+    }
+  }
+
   if (millis() - lastFrameReceived > RECEIVE_TIMEOUT)
   {
     // workaround: reset CC1101, since it stops receiving from time to time
+    Serial.println("Receive timeout, restarting radio...");
     restartRadio();
   }
 }
@@ -239,21 +286,21 @@ void WaterMeter::begin(uint8_t *key, uint8_t *id)
 
   memcpy(aesKey, key, sizeof(aesKey));
   aes128.setKey(aesKey, sizeof(aesKey));
-
+  pinMode(SS, OUTPUT);                // SS Pin -> Output
   memcpy(meterId, id, sizeof(meterId));
 
-  restartRadio();
+
   attachInterruptArg(digitalPinToInterrupt(CC1101_GDO0), cc1101Isr, this, FALLING);
   lastFrameReceived = millis();
 }
 
 void WaterMeter::restartRadio()
 {
-  Serial.println("resetting CC1101");
+  Serial.println("Resetting CC1101...");
+  Serial.printf("GDO0 interrupt pin configured on GPIO%d\n", CC1101_GDO0);
 
   reset(); // power on CC1101
 
-  // Serial.println("Setting CC1101 registers");
   initializeRegisters(); // init CC1101 registers
 
   cmdStrobe(CC1101_SCAL);
@@ -261,6 +308,7 @@ void WaterMeter::restartRadio()
 
   startReceiver();
   lastFrameReceived = millis();
+  Serial.println("CC1101 ready for WMBus reception");
 }
 
 bool WaterMeter::checkFrame(void)
@@ -305,6 +353,176 @@ bool WaterMeter::checkFrame(void)
   }
 
   return true;
+}
+
+// Publish Home Assistant MQTT Discovery configuration
+void WaterMeter::publishHomeAssistantDiscovery(void)
+{
+  if (!mqttEnabled) return;
+
+#if DEBUG >= 1
+  Serial.println("Publishing Home Assistant MQTT Discovery...");
+#endif
+
+  // Create unique device identifier based on ESP MAC address
+  String deviceId = WiFi.macAddress();
+  deviceId.replace(":", "");
+  deviceId.toLowerCase();
+
+  // Device configuration (shared by all entities)
+  String deviceConfig = "\"device\":{";
+  deviceConfig += "\"identifiers\":[\"" + deviceId + "\"],";
+  deviceConfig += "\"name\":\"" + String(DEVICE_NAME) + "\",";
+  deviceConfig += "\"model\":\"" + String(DEVICE_MODEL) + "\",";
+  deviceConfig += "\"manufacturer\":\"" + String(DEVICE_MANUFACTURER) + "\",";
+  deviceConfig += "\"sw_version\":\"" + String(DEVICE_SW_VERSION) + "\",";
+  deviceConfig += "\"configuration_url\":\"http://" + WiFi.localIP().toString() + "\",";
+  deviceConfig += "\"suggested_area\":\"Utility Room\"";
+  deviceConfig += "}";
+
+  // Origin configuration (required for device discovery)
+  String originConfig = "\"origin\":{";
+  originConfig += "\"name\":\"" + String(DEVICE_MANUFACTURER) + "\",";
+  originConfig += "\"sw\":\"" + String(DEVICE_SW_VERSION) + "\",";
+  originConfig += "\"url\":\"https://github.com/chester4444/esp-multical21\"";
+  originConfig += "}";
+
+  // Total Water Consumption Sensor
+  String totalConfig = "{";
+  totalConfig += "\"platform\":\"sensor\",";  // Required field
+  totalConfig += "\"name\":\"Water Total Consumption\",";
+  totalConfig += "\"unique_id\":\"" + deviceId + "_water_total\",";
+  totalConfig += "\"state_topic\":\"" + String(MQTT_PREFIX) + String(MQTT_total) + "\",";
+  totalConfig += "\"device_class\":\"water\",";
+  totalConfig += "\"unit_of_measurement\":\"m³\",";
+  totalConfig += "\"state_class\":\"total_increasing\",";
+  totalConfig += "\"icon\":\"mdi:water\",";
+  totalConfig += originConfig + ",";
+  totalConfig += deviceConfig;
+  totalConfig += "}";
+
+  // Target Water Consumption Sensor
+  String targetConfig = "{";
+  targetConfig += "\"platform\":\"sensor\",";  // Required field
+  targetConfig += "\"name\":\"Water Target Consumption\",";
+  targetConfig += "\"unique_id\":\"" + deviceId + "_water_target\",";
+  targetConfig += "\"state_topic\":\"" + String(MQTT_PREFIX) + String(MQTT_target) + "\",";
+  targetConfig += "\"device_class\":\"water\",";
+  targetConfig += "\"unit_of_measurement\":\"m³\",";
+  targetConfig += "\"state_class\":\"total\",";
+  targetConfig += "\"icon\":\"mdi:water-outline\",";
+  targetConfig += originConfig + ",";
+  targetConfig += deviceConfig;
+  targetConfig += "}";
+
+  // Flow Temperature Sensor
+  String flowTempConfig = "{";
+  flowTempConfig += "\"platform\":\"sensor\",";  // Required field
+  flowTempConfig += "\"name\":\"Water Flow Temperature\",";
+  flowTempConfig += "\"unique_id\":\"" + deviceId + "_flow_temp\",";
+  flowTempConfig += "\"state_topic\":\"" + String(MQTT_PREFIX) + String(MQTT_ftemp) + "\",";
+  flowTempConfig += "\"device_class\":\"temperature\",";
+  flowTempConfig += "\"unit_of_measurement\":\"°C\",";
+  flowTempConfig += "\"state_class\":\"measurement\",";
+  flowTempConfig += "\"icon\":\"mdi:thermometer\",";
+  flowTempConfig += originConfig + ",";
+  flowTempConfig += deviceConfig;
+  flowTempConfig += "}";
+
+  // Ambient Temperature Sensor
+  String ambientTempConfig = "{";
+  ambientTempConfig += "\"platform\":\"sensor\",";  // Required field
+  ambientTempConfig += "\"name\":\"Water Ambient Temperature\",";
+  ambientTempConfig += "\"unique_id\":\"" + deviceId + "_ambient_temp\",";
+  ambientTempConfig += "\"state_topic\":\"" + String(MQTT_PREFIX) + String(MQTT_atemp) + "\",";
+  ambientTempConfig += "\"device_class\":\"temperature\",";
+  ambientTempConfig += "\"unit_of_measurement\":\"°C\",";
+  ambientTempConfig += "\"state_class\":\"measurement\",";
+  ambientTempConfig += "\"icon\":\"mdi:thermometer-lines\",";
+  ambientTempConfig += originConfig + ",";
+  ambientTempConfig += deviceConfig;
+  ambientTempConfig += "}";
+
+  // Info Code Sensor
+  String infoConfig = "{";
+  infoConfig += "\"platform\":\"sensor\",";  // Required field
+  infoConfig += "\"name\":\"Water Meter Info Code\",";
+  infoConfig += "\"unique_id\":\"" + deviceId + "_info_code\",";
+  infoConfig += "\"state_topic\":\"" + String(MQTT_PREFIX) + String(MQTT_info) + "\",";
+  infoConfig += "\"icon\":\"mdi:information\",";
+  infoConfig += originConfig + ",";
+  infoConfig += deviceConfig;
+  infoConfig += "}";
+
+  // Publish discovery messages with correct topic format
+  String discoveryPrefix = String(HA_DISCOVERY_PREFIX) + "/sensor/" + deviceId;
+
+#if DEBUG >= 1
+  Serial.println("Publishing Home Assistant MQTT Discovery messages:");
+  Serial.printf("Device ID: %s\n", deviceId.c_str());
+  Serial.printf("Discovery prefix: %s\n", discoveryPrefix.c_str());
+#endif
+
+  // Publish each discovery message with detailed logging
+  String topics[] = {
+    discoveryPrefix + "/water_total/config",
+    discoveryPrefix + "/water_target/config",
+    discoveryPrefix + "/flow_temp/config",
+    discoveryPrefix + "/ambient_temp/config",
+    discoveryPrefix + "/info_code/config"
+  };
+
+  String configs[] = {totalConfig, targetConfig, flowTempConfig, ambientTempConfig, infoConfig};
+  String names[] = {"Water Total", "Water Target", "Flow Temp", "Ambient Temp", "Info Code"};
+
+#if DEBUG >= 1
+  Serial.printf("MQTT buffer size: %d bytes\n", mqttClient.getBufferSize());
+#endif
+
+  for (int i = 0; i < 5; i++) {
+    size_t configSize = configs[i].length();
+
+#if DEBUG >= 1
+    Serial.printf("Publishing %s (%d bytes)...", names[i].c_str(), configSize);
+#endif
+
+    bool published = mqttClient.publish(topics[i].c_str(), configs[i].c_str(), true);
+
+#if DEBUG >= 1
+    Serial.printf(" %s\n", published ? "✓" : "✗");
+    if (!published) {
+      Serial.printf("  Topic: %s\n", topics[i].c_str());
+      Serial.printf("  Payload size: %d bytes\n", configSize);
+      Serial.printf("  Buffer size: %d bytes\n", mqttClient.getBufferSize());
+      if (configSize > mqttClient.getBufferSize()) {
+        Serial.println("  ERROR: Payload exceeds buffer size!");
+      }
+    }
+#endif
+
+    mqttClient.loop();
+    delay(100);
+  }
+
+#if DEBUG >= 1
+  Serial.println("Home Assistant MQTT Discovery publishing completed");
+#endif
+}
+
+// Publish availability status
+void WaterMeter::publishAvailability(bool online)
+{
+  if (!mqttEnabled) return;
+
+  String availabilityTopic = String(MQTT_PREFIX) + "/availability";
+  const char* payload = online ? "\"online\"" : "\"offline\"";
+
+  mqttClient.publish(availabilityTopic.c_str(), payload, true);
+  mqttClient.loop();
+
+#if DEBUG >= 1
+  Serial.printf("Published availability: %s\n", payload);
+#endif
 }
 
 void WaterMeter::getMeterInfo(uint8_t *data, size_t len)
@@ -353,19 +571,61 @@ void WaterMeter::publishMeterInfo()
   snprintf(ambient_temp, sizeof(ambient_temp), "%2d", ambientTemp);
   Serial.printf("%s %cC - ", ambient_temp, 176);
 
-  char info_codes[3];
-  snprintf(info_codes, sizeof(info_codes), "%02x", infoCodes);
-  Serial.printf("0x%s \n\r", info_codes);
+  // Map info codes to meaningful states for Home Assistant
+  char info_codes_display[16];
+  char info_codes_mqtt[16];
+
+  switch(infoCodes) {
+    case 0x00:
+      snprintf(info_codes_display, sizeof(info_codes_display), "normal");
+      snprintf(info_codes_mqtt, sizeof(info_codes_mqtt), "normal");
+      break;
+    case 0x01:
+      snprintf(info_codes_display, sizeof(info_codes_display), "dry");
+      snprintf(info_codes_mqtt, sizeof(info_codes_mqtt), "dry");
+      break;
+    case 0x02:
+      snprintf(info_codes_display, sizeof(info_codes_display), "reverse");
+      snprintf(info_codes_mqtt, sizeof(info_codes_mqtt), "reverse");
+      break;
+    case 0x04:
+      snprintf(info_codes_display, sizeof(info_codes_display), "leak");
+      snprintf(info_codes_mqtt, sizeof(info_codes_mqtt), "leak");
+      break;
+    case 0x08:
+      snprintf(info_codes_display, sizeof(info_codes_display), "burst");
+      snprintf(info_codes_mqtt, sizeof(info_codes_mqtt), "burst");
+      break;
+    default:
+      snprintf(info_codes_display, sizeof(info_codes_display), "0x%02x", infoCodes);
+      snprintf(info_codes_mqtt, sizeof(info_codes_mqtt), "code_0x%02x", infoCodes);
+      break;
+  }
+
+  Serial.printf("%s \n\r", info_codes_display);
 
   if (!mqttEnabled) return; // no MQTT broker connected, leave
 
+  // Publish numeric values as JSON numbers (no quotes)
+  char total_json[12];
+  snprintf(total_json, sizeof(total_json), "%.3f", totalWater / 1000.0);
+
+  char target_json[12];
+  snprintf(target_json, sizeof(target_json), "%.3f", targetWater / 1000.0);
+
+  char flow_temp_json[8];
+  snprintf(flow_temp_json, sizeof(flow_temp_json), "%d", flowTemp);
+
+  char ambient_temp_json[8];
+  snprintf(ambient_temp_json, sizeof(ambient_temp_json), "%d", ambientTemp);
+
   // change the topics as you like
-  mqttClient.publish(MQTT_PREFIX MQTT_total, total);
-  mqttClient.publish(MQTT_PREFIX MQTT_target, target);
+  mqttClient.publish(MQTT_PREFIX MQTT_total, total_json);
+  mqttClient.publish(MQTT_PREFIX MQTT_target, target_json);
   mqttClient.loop();
-  mqttClient.publish(MQTT_PREFIX MQTT_ftemp, flow_temp);
-  mqttClient.publish(MQTT_PREFIX MQTT_atemp, ambient_temp);
-  mqttClient.publish(MQTT_PREFIX MQTT_info, info_codes);
+  mqttClient.publish(MQTT_PREFIX MQTT_ftemp, flow_temp_json);
+  mqttClient.publish(MQTT_PREFIX MQTT_atemp, ambient_temp_json);
+  mqttClient.publish(MQTT_PREFIX MQTT_info, info_codes_mqtt);
   mqttClient.loop();
 }
 
@@ -378,77 +638,212 @@ uint8_t WaterMeter::readByteFromFifo(void)
 // handles a received frame and restart the CC1101 receiver
 void WaterMeter::receive()
 {
-  // read preamble, should be 0x543D
+  // read preamble
   uint8_t p1 = readByteFromFifo();
   uint8_t p2 = readByteFromFifo();
-  
-#if DEBUG
-  Serial.printf("%02x%02x", p1, p2);
+
+#if DEBUG >= 1
+  Serial.printf("Packet received - Preamble: %02X%02X", p1, p2);
 #endif
 
   // get length
   payload[0] = readByteFromFifo();
 
-  // is it Mode C1, frame B and does it fit in the buffer
-  if ((payload[0] < MAX_LENGTH) && (p1 == 0x54) && (p2 == 0x3D))
-  {
-    // 3rd byte is payload length
-    length = payload[0];
-
-#if DEBUG
-    Serial.printf("%02X", length);
+#if DEBUG >= 1
+  Serial.printf(" Length: %02X", payload[0]);
 #endif
 
-    // starting with 1! index 0 is lfield
-    for (int i = 0; i < length; i++)
+  if (payload[0] < MAX_LENGTH)
+  {
+    // Read the rest of the data regardless of preamble
+    for (int i = 0; i < payload[0] && i < MAX_LENGTH - 1; i++)
     {
       payload[i + 1] = readByteFromFifo();
     }
 
-    // check meterId, CRC
-    if (checkFrame())
+#if DEBUG >= 2
+    // Show raw packet data only in verbose mode
+    Serial.printf(" Raw packet (%d bytes): ", payload[0] + 3);
+    Serial.printf("%02X%02X%02X", p1, p2, payload[0]);
+    for (int i = 0; i < payload[0] && i < MAX_LENGTH - 1; i++)
     {
-      uint8_t cipherLength = length - 2 - 16; // cipher starts at index 16, remove 2 crc bytes
-      memcpy(cipher, &payload[17], cipherLength);
-
-      memset(iv, 0, sizeof(iv)); // padding with 0
-      memcpy(iv, &payload[2], 8);
-      iv[8] = payload[11];
-      memcpy(&iv[9], &payload[13], 4);
-
-#if DEBUG
-      printHex(iv, sizeof(iv));
-      printHex(cipher, cipherLength);
+      Serial.printf("%02X", payload[i + 1]);
+    }
+    Serial.println();
 #endif
 
-      aes128.setIV(iv, sizeof(iv));
-      aes128.decrypt(plaintext, (const uint8_t *)cipher, cipherLength);
+    // Try to process any packet that looks like WMBus
+    if (payload[0] >= 10) // Minimum reasonable packet size for WMBus
+    {
+#if DEBUG >= 1
+      Serial.println(" - Processing...");
+#endif
 
-      /*
-        Serial.printf("C:     ");
-        for (size_t i = 0; i < cipherLength; i++)
-        {
-          Serial.printf("%02X", cipher[i]);
-        }
-        Serial.println();
-        Serial.printf("P(%d): ", cipherLength);
-        for (size_t i = 0; i < cipherLength; i++)
-        {
-          Serial.printf("%02X", plaintext[i]);
-        }
-        Serial.println();
-      */
+      // 3rd byte is payload length
+      length = payload[0];
 
-      // received packet is ok
-      lastPacketDecoded = millis();
-
-      lastFrameReceived = millis();
-      getMeterInfo(plaintext, cipherLength);
-      publishMeterInfo();
+      // Try to decrypt and process the packet
+      if (processWMBusPacket())
+      {
+#if DEBUG >= 1
+        Serial.println("✓ Packet successfully processed!");
+#endif
+        lastPacketDecoded = millis();
+        lastFrameReceived = millis();
+      }
+      else
+      {
+#if DEBUG >= 1
+        Serial.println("✗ Packet processing failed");
+#endif
+      }
     }
+#if DEBUG >= 1
+    else
+    {
+      Serial.println(" - Packet too short, ignoring");
+    }
+#endif
+  }
+  else
+  {
+#if DEBUG >= 1
+    Serial.printf(" Invalid length: %d (max: %d)\n", payload[0], MAX_LENGTH);
+#endif
   }
 
   // flush RX fifo and restart receiver
   startReceiver();
-  // Serial.printf("rxStatus: 0x%02x\n\r", readStatusReg(CC1101_RXBYTES));
+}
+
+// Process and decrypt WMBus packet regardless of preamble
+bool WaterMeter::processWMBusPacket(void)
+{
+#if DEBUG >= 2
+  // Print detailed packet analysis only in verbose mode
+  Serial.printf("Processing packet - Length: %d bytes\n", length);
+#endif
+
+  // Check if this packet is for our meter
+  if (length >= 8)
+  {
+    bool meterMatch = true;
+    for (uint8_t i = 0; i < 4; i++)
+    {
+      if (meterId[i] != payload[7 - i])
+      {
+        meterMatch = false;
+        break;
+      }
+    }
+
+    if (!meterMatch)
+    {
+#if DEBUG >= 2
+      // Print meter ID comparison only in verbose mode
+      Serial.printf("Packet meter ID: ");
+      for (uint8_t i = 0; i < 4; i++)
+      {
+        Serial.printf("%02X", payload[7-i]);
+      }
+      Serial.printf(" (expected: ");
+      for (uint8_t i = 0; i < 4; i++)
+      {
+        Serial.printf("%02X", meterId[i]);
+      }
+      Serial.println(") - skipping");
+#endif
+      return false;
+    }
+
+#if DEBUG >= 2
+    Serial.println("Meter ID matches! Attempting decryption...");
+#endif
+  }
+  else
+  {
+#if DEBUG >= 1
+    Serial.println("Packet too short for meter ID check");
+#endif
+    return false;
+  }
+
+  // Check if packet is long enough for encryption
+  if (length < 18) // Need at least header + some encrypted data
+  {
+#if DEBUG >= 1
+    Serial.println("Packet too short for encrypted data");
+#endif
+    return false;
+  }
+
+  // Calculate CRC and verify
+  uint16_t crc = crcEN13575(payload, length - 1); // -2 (CRC) + 1 (L-field)
+  uint16_t packetCrc = (payload[length - 1] << 8) | payload[length];
+
+  if (crc != packetCrc)
+  {
+#if DEBUG >= 1
+    Serial.printf("CRC mismatch: calculated=0x%04X, packet=0x%04X\n", crc, packetCrc);
+#endif
+    return false;
+  }
+
+#if DEBUG >= 2
+  Serial.printf("CRC OK (0x%04X) - attempting decryption\n", crc);
+#endif
+
+  // Extract cipher data (starts at index 17, after header)
+  uint8_t cipherLength = length - 2 - 16; // cipher starts at index 16, remove 2 crc bytes
+  if (cipherLength > MAX_LENGTH - 17)
+  {
+#if DEBUG >= 1
+    Serial.printf("Cipher too long: %d bytes\n", cipherLength);
+#endif
+    return false;
+  }
+
+  memcpy(cipher, &payload[17], cipherLength);
+
+  // Build IV for decryption
+  memset(iv, 0, sizeof(iv)); // padding with 0
+  memcpy(iv, &payload[2], 8);  // M-field + A-field
+  iv[8] = payload[11];         // CI-field
+  memcpy(&iv[9], &payload[13], 4); // Access number + status + configuration
+
+#if DEBUG >= 2
+  // Show encryption details only in verbose mode
+  Serial.printf("IV: ");
+  for (int i = 0; i < 16; i++)
+  {
+    Serial.printf("%02X", iv[i]);
+  }
+  Serial.println();
+
+  Serial.printf("Cipher (%d bytes): ", cipherLength);
+  for (int i = 0; i < cipherLength; i++)
+  {
+    Serial.printf("%02X", cipher[i]);
+  }
+  Serial.println();
+#endif
+
+  // Decrypt the data
+  aes128.setIV(iv, sizeof(iv));
+  aes128.decrypt(plaintext, (const uint8_t *)cipher, cipherLength);
+
+#if DEBUG >= 2
+  Serial.printf("Plaintext (%d bytes): ", cipherLength);
+  for (int i = 0; i < cipherLength; i++)
+  {
+    Serial.printf("%02X", plaintext[i]);
+  }
+  Serial.println();
+#endif
+
+  // Extract meter information from decrypted data
+  getMeterInfo(plaintext, cipherLength);
+  publishMeterInfo();
+
+  return true;
 }

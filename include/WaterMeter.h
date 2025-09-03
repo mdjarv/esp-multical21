@@ -21,6 +21,11 @@
 #include <AES.h>
 #include <CTR.h>
 #include <PubSubClient.h>
+#if defined(ESP8266)
+  #include <ESP8266WiFi.h>
+#elif defined(ESP32)
+  #include <WiFi.h>
+#endif
 #include "config.h"
 #include "utils.h"
 
@@ -138,7 +143,7 @@
 #define CC1101_TXBYTES           0x3A        // Underflow and Number of Bytes
 #define CC1101_RXBYTES           0x3B        // Overflow and Number of Bytes
 #define CC1101_RCCTRL1_STATUS    0x3C        // Last RC Oscillator Calibration Result
-#define CC1101_RCCTRL0_STATUS    0x3D        // Last RC Oscillator Calibration Result 
+#define CC1101_RCCTRL0_STATUS    0x3D        // Last RC Oscillator Calibration Result
 
 #define CC1101_DEFVAL_SYNC1      0x54        // Synchronization word, high byte
 #define CC1101_DEFVAL_SYNC0      0x3D        // Synchronization word, low byte
@@ -176,7 +181,7 @@
 #define CC1101_DEFVAL_TEST1      0x35        // Various Test Settings
 #define CC1101_DEFVAL_TEST0      0x09        // Various Test Settings
 #define CC1101_DEFVAL_PKTCTRL1   0x00        // Packet Automation Control
-#define CC1101_DEFVAL_PKTCTRL0   0x02        // 2 - infinite length 
+#define CC1101_DEFVAL_PKTCTRL0   0x02        // 2 - infinite length
 #define CC1101_DEFVAL_ADDR       0x00        // Device Address
 #define CC1101_DEFVAL_PKTLEN     0x30        // Packet Length
 #define CC1101_DEFVAL_FIFOTHR    0x00        // RX 4 bytes and TX 61 bytes Thresholds
@@ -230,24 +235,29 @@ class WaterMeter
     // static ISR calls instanceISR via this pointer
     IRAM_ATTR static void cc1101Isr(void *p);
 
-    // receive a wmbus frame 
+    // receive a wmbus frame
     void receive(void); // read frame from CC1101
     bool checkFrame(void);  // check id, CRC
+    bool processWMBusPacket(void); // process and decrypt WMBus packet
     void getMeterInfo(uint8_t *data, size_t len);
     void publishMeterInfo();
-    
+
   public:
 
     // constructor
     WaterMeter(PubSubClient &mqtt);
-    
+
     void enableMqtt(bool enable);
 
-    // startup CC1101 for receiving wmbus mode c 
+    // startup CC1101 for receiving wmbus mode c
     void begin(uint8_t *key, uint8_t *id);
 
     // must be called frequently
     void loop(void);
+
+    // Home Assistant MQTT Discovery
+    void publishHomeAssistantDiscovery(void);
+    void publishAvailability(bool online);
 
     IRAM_ATTR void instanceCC1101Isr();
 };
